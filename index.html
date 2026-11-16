@@ -9,6 +9,10 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+  <!-- Firebase (login com Google + sincronização na nuvem) -->
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
   <script>
     tailwind.config = {
       darkMode: 'class',
@@ -199,6 +203,12 @@
 
       <!-- Indicador elegante de data no topo -->
       <div class="flex items-center gap-2">
+        <!-- Conta Google / sincronização na nuvem -->
+        <button id="nuvem-btn" onclick="nuvemClique()" title="Entrar com Google para salvar na nuvem e usar em outros aparelhos" class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white border border-blue-300/80 text-[11px] text-slate-600 hover:border-indigo-400 hover:text-slate-800 transition-colors max-w-[190px]">
+          <img id="nuvem-foto" class="w-4 h-4 rounded-full hidden" alt="" referrerpolicy="no-referrer">
+          <span id="nuvem-ponto" class="w-1.5 h-1.5 rounded-full bg-slate-300 shrink-0"></span>
+          <span id="nuvem-label" class="truncate">Entrar com Google</span>
+        </button>
         <div class="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-blue-50/80 border border-blue-300/80 text-[11px] text-slate-600">
           <span class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse"></span>
           <span id="topbar-today-name" class="font-medium text-slate-700 capitalize">Hoje</span>
@@ -1319,10 +1329,17 @@
           showToast('Gravação bloqueada: os dados ficariam vazios. Recarregue a página ou importe um backup.', 'warning');
           return;
         }
+        // "savedAt" só muda quando o conteúdo muda de verdade (usado pra decidir qual versão é a mais nova na nuvem).
+        if (prev && typeof prev === 'object' && prev.savedAt) {
+          const semDataNovo = Object.assign({}, payload); delete semDataNovo.savedAt;
+          const semDataAnt = Object.assign({}, prev); delete semDataAnt.savedAt;
+          if (JSON.stringify(semDataNovo) === JSON.stringify(semDataAnt)) payload.savedAt = prev.savedAt;
+        }
         const json = JSON.stringify(payload);
         localStorage.setItem(STORAGE_KEY, json);
         snapshotDiario(json);
         agendarBackupArquivo(json);
+        if (typeof nuvemAgendarEnvio === 'function') nuvemAgendarEnvio();
       } catch (e) {
         console.error('Falha ao salvar estado:', e);
         showToast('Não consegui salvar automaticamente (armazenamento cheio?)', 'warning');
@@ -3634,6 +3651,253 @@
       }
     }, 60000);
 
+    // ---------- NUVEM: login com Google + sincronização no Firestore ----------
+    // O navegador continua sendo o "cache" (funciona offline). Logado, cada alteração também vai
+    // pro documento usuarios/{uid} no Firestore, e alterações feitas em outro aparelho chegam aqui.
+    const FIREBASE_CONFIG = {
+      apiKey: "AIzaSyBe1ZOY_XYgYSta78UCZPI130-mGvcAJsU",
+      authDomain: "lembrete-ef92d.firebaseapp.com",
+      projectId: "lembrete-ef92d",
+      storageBucket: "lembrete-ef92d.firebasestorage.app",
+      messagingSenderId: "1044009241269",
+      appId: "1:1044009241269:web:849468c56c33703704ccfc"
+    };
+    const NUVEM_COLECAO = 'usuarios';
+    const NUVEM_CLIENT_ID = 'c_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const NUVEM_BACKUP_KEY = 'focusflow_backup_antes_nuvem';
+    let nuvemAuth = null, nuvemDb = null, nuvemUser = null;
+    let nuvemPronta = false, nuvemAplicando = false, nuvemEnviando = false;
+    let nuvemTimer = null, nuvemUnsub = null;
+
+    function nuvemHash(str) {
+      let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+      for (let i = 0; i < str.length; i++) {
+        const ch = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+      }
+      h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+      h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+      return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+    }
+
+    // Conteúdo sem o carimbo de data, pra comparar se duas versões são iguais de verdade
+    function nuvemDados(json) {
+      try {
+        const o = JSON.parse(json || 'null');
+        if (!o || !Array.isArray(o.tasks) || !Array.isArray(o.routines)) return null;
+        const semData = Object.assign({}, o); delete semData.savedAt;
+        return { obj: o, hash: nuvemHash(JSON.stringify(semData)) };
+      } catch (e) { return null; }
+    }
+
+    function nuvemMarcaKey() { return 'focusflow_nuvem_sync_' + (nuvemUser ? nuvemUser.uid : ''); }
+    function nuvemMarca() { return localStorage.getItem(nuvemMarcaKey()); }
+    function nuvemSetMarca(h) { try { localStorage.setItem(nuvemMarcaKey(), h); } catch (e) {} }
+
+    function nuvemStatus(texto, cor) {
+      const label = document.getElementById('nuvem-label');
+      const ponto = document.getElementById('nuvem-ponto');
+      const foto = document.getElementById('nuvem-foto');
+      const btn = document.getElementById('nuvem-btn');
+      if (!label) return;
+      label.textContent = texto;
+      const cores = { cinza: 'bg-slate-300', verde: 'bg-emerald-500', amarelo: 'bg-amber-400 animate-pulse', vermelho: 'bg-rose-500' };
+      ponto.className = 'w-1.5 h-1.5 rounded-full shrink-0 ' + (cores[cor] || cores.cinza);
+      if (nuvemUser && nuvemUser.photoURL) { foto.src = nuvemUser.photoURL; foto.classList.remove('hidden'); }
+      else foto.classList.add('hidden');
+      btn.title = nuvemUser
+        ? `Conectado como ${nuvemUser.email || nuvemUser.displayName || ''}. Clique para sair.`
+        : 'Entrar com Google para salvar na nuvem e usar em outros aparelhos';
+    }
+
+    function nuvemNomeCurto() {
+      if (!nuvemUser) return '';
+      return (nuvemUser.displayName || nuvemUser.email || '').split(/[ @]/)[0];
+    }
+
+    function nuvemRef() { return nuvemDb.collection(NUVEM_COLECAO).doc(nuvemUser.uid); }
+
+    // Troca os dados deste aparelho pelos da nuvem (sem reenviar pra nuvem durante a troca)
+    function nuvemAplicarRemoto(remotoJson, remotoHash, guardarLocal) {
+      try {
+        if (guardarLocal) {
+          const atual = localStorage.getItem(STORAGE_KEY);
+          if (atual) localStorage.setItem(NUVEM_BACKUP_KEY, atual);
+        }
+      } catch (e) {}
+      nuvemAplicando = true;
+      try {
+        localStorage.setItem(STORAGE_KEY, remotoJson);
+        loadState();
+        runDailyRollover();
+        renderAll();
+      } finally {
+        nuvemAplicando = false;
+      }
+      nuvemSetMarca(remotoHash);
+    }
+
+    async function nuvemEnviarAgora() {
+      if (!nuvemUser || !nuvemDb) return;
+      const json = localStorage.getItem(STORAGE_KEY);
+      const local = nuvemDados(json);
+      if (!local) return;
+      if (local.hash === nuvemMarca()) { nuvemStatus(nuvemNomeCurto() + ' · salvo', 'verde'); return; }
+      if (json.length > 900000) console.warn('Dados perto do limite de 1 MB do Firestore:', json.length, 'bytes');
+      nuvemEnviando = true;
+      nuvemStatus('Salvando…', 'amarelo');
+      try {
+        await nuvemRef().set({
+          json,
+          hash: local.hash,
+          savedAt: local.obj.savedAt || null,
+          clientId: NUVEM_CLIENT_ID,
+          email: nuvemUser.email || null,
+          atualizadoEm: firebase.firestore.FieldValue.serverTimestamp()
+        });
+        nuvemSetMarca(local.hash);
+        nuvemStatus(nuvemNomeCurto() + ' · salvo', 'verde');
+      } catch (e) {
+        console.error('Falha ao salvar na nuvem:', e);
+        nuvemStatus('Erro ao salvar na nuvem', 'vermelho');
+        if (e && e.code === 'permission-denied') showToast('A nuvem recusou a gravação: confira as Regras do Firestore.', 'warning');
+      } finally {
+        nuvemEnviando = false;
+      }
+    }
+
+    function nuvemAgendarEnvio() {
+      if (!nuvemPronta || nuvemAplicando || !nuvemUser) return;
+      clearTimeout(nuvemTimer);
+      nuvemStatus('Salvando…', 'amarelo');
+      nuvemTimer = setTimeout(() => { nuvemTimer = null; nuvemEnviarAgora(); }, 1500);
+    }
+
+    // Decide entre a versão deste aparelho e a da nuvem
+    async function nuvemResolver(remotoJson, origem) {
+      const local = nuvemDados(localStorage.getItem(STORAGE_KEY));
+      if (!remotoJson) { if (local) await nuvemEnviarAgora(); return; }
+      const remoto = nuvemDados(remotoJson);
+      if (!remoto) return;
+      if (local && remoto.hash === local.hash) { nuvemSetMarca(remoto.hash); return; }
+      if (!local) { nuvemAplicarRemoto(remotoJson, remoto.hash, false); return; }
+
+      const marca = nuvemMarca();
+      if (!marca) {
+        // Primeira vez desta conta neste aparelho e os dados são diferentes: o usuário escolhe.
+        const qLocal = contarItensPayload(local.obj), qRemoto = contarItensPayload(remoto.obj);
+        const quando = remoto.obj.savedAt ? new Date(remoto.obj.savedAt).toLocaleString('pt-BR') : 'data desconhecida';
+        const usarNuvem = confirm(
+          `Sua conta já tem dados salvos na nuvem (${qRemoto} itens, salvos em ${quando}).\n` +
+          `Este aparelho tem outros dados (${qLocal} itens).\n\n` +
+          `OK = usar os dados da NUVEM neste aparelho.\n` +
+          `Cancelar = enviar os dados DESTE aparelho para a nuvem (substitui os da nuvem).\n\n` +
+          `Uma cópia dos dados deste aparelho fica guardada como backup.`
+        );
+        try { localStorage.setItem(NUVEM_BACKUP_KEY, localStorage.getItem(STORAGE_KEY)); } catch (e) {}
+        if (usarNuvem) { nuvemAplicarRemoto(remotoJson, remoto.hash, false); showToast('Dados da nuvem carregados', 'success'); }
+        else { nuvemSetMarca(remoto.hash); await nuvemEnviarAgora(); showToast('Dados deste aparelho enviados para a nuvem', 'success'); }
+        return;
+      }
+
+      const localMudou = local.hash !== marca;
+      const remotoMudou = remoto.hash !== marca;
+      if (!remotoMudou) { if (localMudou) await nuvemEnviarAgora(); return; }
+      if (!localMudou) {
+        nuvemAplicarRemoto(remotoJson, remoto.hash, false);
+        if (origem === 'tempo-real') showToast('Atualizado com alterações de outro aparelho', 'info');
+        return;
+      }
+      // Mudou nos dois lugares: fica a versão alterada por último; a outra vira backup local.
+      const dLocal = local.obj.savedAt || '', dRemoto = remoto.obj.savedAt || '';
+      if (dRemoto >= dLocal) {
+        nuvemAplicarRemoto(remotoJson, remoto.hash, true);
+        showToast('Havia alterações em dois aparelhos: fiquei com a mais recente (da nuvem). A outra foi guardada em backup.', 'warning');
+      } else {
+        try { localStorage.setItem(NUVEM_BACKUP_KEY, remotoJson); } catch (e) {}
+        await nuvemEnviarAgora();
+      }
+    }
+
+    async function nuvemAoEntrar(user) {
+      nuvemUser = user;
+      nuvemPronta = false;
+      nuvemStatus('Conectando…', 'amarelo');
+      try {
+        const snap = await nuvemRef().get();
+        await nuvemResolver(snap.exists ? (snap.data() || {}).json : null, 'login');
+        nuvemPronta = true;
+        if (nuvemUser) nuvemStatus(nuvemNomeCurto() + ' · salvo', 'verde');
+        // Se algo mudou aqui durante a conexão (ex: rollover do dia), garante o envio
+        nuvemAgendarEnvio();
+        if (nuvemUnsub) nuvemUnsub();
+        nuvemUnsub = nuvemRef().onSnapshot(s => {
+          if (!s.exists || s.metadata.hasPendingWrites) return;
+          const d = s.data() || {};
+          if (!d.json || d.clientId === NUVEM_CLIENT_ID) return;
+          if (nuvemTimer || nuvemEnviando) return; // alteração local pendente: ela vai pra nuvem e vence
+          nuvemResolver(d.json, 'tempo-real');
+        }, e => {
+          console.error('Sincronização em tempo real falhou:', e);
+          nuvemStatus('Sem sincronização', 'vermelho');
+        });
+      } catch (e) {
+        console.error('Falha ao conectar na nuvem:', e);
+        nuvemStatus('Erro na nuvem', 'vermelho');
+        if (e && e.code === 'permission-denied') showToast('A nuvem recusou o acesso: confira as Regras do Firestore.', 'warning');
+        else showToast('Não consegui conectar na nuvem. Os dados continuam salvos neste aparelho.', 'warning');
+      }
+    }
+
+    function nuvemAoSair() {
+      if (nuvemUnsub) { nuvemUnsub(); nuvemUnsub = null; }
+      clearTimeout(nuvemTimer); nuvemTimer = null;
+      nuvemUser = null;
+      nuvemPronta = false;
+      nuvemStatus('Entrar com Google', 'cinza');
+    }
+
+    async function nuvemEntrar() {
+      const provider = new firebase.auth.GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      try {
+        await nuvemAuth.signInWithPopup(provider);
+      } catch (e) {
+        const code = e && e.code;
+        if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
+        if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
+          return nuvemAuth.signInWithRedirect(provider);
+        }
+        if (code === 'auth/unauthorized-domain') showToast('Este endereço não está nos Domínios autorizados do Firebase.', 'warning');
+        else if (code === 'auth/operation-not-allowed') showToast('O login com Google não está ativado no Firebase.', 'warning');
+        else showToast('Não consegui entrar: ' + ((e && e.message) || code), 'warning');
+      }
+    }
+
+    async function nuvemClique() {
+      if (!nuvemAuth) { showToast('A nuvem não carregou. Confira a internet e recarregue a página.', 'warning'); return; }
+      if (!nuvemUser) { nuvemEntrar(); return; }
+      const quem = nuvemUser.email || nuvemUser.displayName || 'sua conta';
+      if (!confirm(`Sair de ${quem}?\n\nOs dados continuam salvos neste aparelho e na nuvem.`)) return;
+      if (nuvemTimer) { clearTimeout(nuvemTimer); nuvemTimer = null; await nuvemEnviarAgora(); }
+      await nuvemAuth.signOut();
+    }
+
+    function nuvemInit() {
+      if (!window.firebase) { nuvemStatus('Nuvem indisponível', 'vermelho'); return; }
+      try {
+        firebase.initializeApp(FIREBASE_CONFIG);
+        nuvemAuth = firebase.auth();
+        nuvemDb = firebase.firestore();
+        nuvemAuth.getRedirectResult().catch(e => console.warn('Retorno do login falhou:', e));
+        nuvemAuth.onAuthStateChanged(user => { if (user) nuvemAoEntrar(user); else nuvemAoSair(); });
+      } catch (e) {
+        console.error('Falha ao iniciar o Firebase:', e);
+        nuvemStatus('Nuvem indisponível', 'vermelho');
+      }
+    }
+
     window.addEventListener('DOMContentLoaded', async () => {
       await bkInit();
       loadState(); // já chama migrateRecurringTasksToRoutines()/normalizeRoutines()/normalizeNotes() quando existe estado salvo
@@ -3646,6 +3910,7 @@
       runDailyRollover();
       renderAll();
       checkAlarms();
+      nuvemInit(); // login com Google + sincronização (os dados locais já estão carregados antes)
 
       // Cobre o caso da aba ficar aberta de um dia pro outro sem recarregar a página
       setInterval(checkDateRollover, 60000);
